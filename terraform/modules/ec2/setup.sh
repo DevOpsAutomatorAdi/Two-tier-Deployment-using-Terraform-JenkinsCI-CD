@@ -19,7 +19,7 @@ sudo usermod -aG docker ubuntu
 
 # Clone project
 git clone https://github.com/DevOpsAutomatorAdi/Two-tier-Deployment-using-Terraform-JenkinsCI-CD.git
-cd loginflask
+cd terraform
 
 # Run containers using new Docker compose syntax
 sudo docker compose up -d
