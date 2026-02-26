@@ -18,7 +18,7 @@ sudo systemctl start docker
 sudo usermod -aG docker ubuntu
 
 # Clone project
-git clone --branch postgres https://github.com/DevOpsAutomatorAdi/loginflask.git
+git clone https://github.com/DevOpsAutomatorAdi/Two-tier-Deployment-using-Terraform-JenkinsCI-CD.git
 cd loginflask
 
 # Run containers using new Docker compose syntax
