@@ -1,0 +1,144 @@
+pipeline {
+    agent any
+
+    parameters {
+        booleanParam(
+            name: 'DESTROY',
+            defaultValue: false,
+            description: 'Destroy infrastructure'
+        )
+    }
+
+    environment {
+        TF_ROOT = "terraform"
+        REPO = "https://github.com/DevOpsAutomatorAdi/Two-tier-Deployment-using-Terraform-JenkinsCI-CD.git"
+    }
+
+    stages {
+
+        stage('Clone Repository') {
+            steps {
+                sh '''
+                rm -rf project
+                git clone $REPO project
+                cd project
+                ls -la
+                '''
+            }
+        }
+
+        stage('Validate Terraform') {
+            steps {
+                sh '''
+                cd project
+
+                if [ ! -d "$TF_ROOT" ]; then
+                  echo "Terraform folder not found!"
+                  exit 1
+                fi
+
+                terraform -chdir=$TF_ROOT init -input=false
+                terraform -chdir=$TF_ROOT validate
+                terraform -chdir=$TF_ROOT fmt -check
+                '''
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                sh '''
+                cd project
+                terraform -chdir=$TF_ROOT init -input=false
+                terraform -chdir=$TF_ROOT plan -out=tfplan
+                '''
+            }
+        }
+
+        stage('Manual Approval') {
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input message: "Approve Infrastructure Provision?", ok: "Apply Terraform"
+                }
+            }
+        }
+
+        stage('Provision Infrastructure') {
+            steps {
+                sh '''
+                cd project
+                terraform -chdir=$TF_ROOT apply -auto-approve
+
+                terraform -chdir=$TF_ROOT output -raw instance_public_ip > server_ip.txt
+                terraform -chdir=$TF_ROOT output -raw private_key > private_key.pem
+                '''
+            }
+        }
+
+        stage('Deploy Application') {
+            steps {
+                sh '''
+                cd project
+                chmod 600 private_key.pem
+
+                SERVER_IP=$(cat server_ip.txt)
+
+                ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP \
+                "docker ps || true"
+
+                ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP \
+                "cd ~/gitlab-test && docker compose down || true && docker compose up -d --build"
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                cd project
+                SERVER_IP=$(cat server_ip.txt)
+
+                echo "Checking application..."
+                sleep 20
+                curl -f http://$SERVER_IP:8085
+                '''
+            }
+        }
+
+        stage('Capture Homepage') {
+            steps {
+                sh '''
+                cd project
+                SERVER_IP=$(cat server_ip.txt)
+
+                curl http://$SERVER_IP:8085 -o directus_homepage.html
+                '''
+            }
+        }
+
+        stage('Generate Report') {
+            steps {
+                sh '''
+                cd project
+                SERVER_IP=$(cat server_ip.txt)
+
+                echo "# Deployment Report" > deployment_report.md
+                echo "- Server IP: $SERVER_IP" >> deployment_report.md
+                echo "- Pipeline Status: SUCCESS" >> deployment_report.md
+                echo "- URL: http://$SERVER_IP:8085" >> deployment_report.md
+                '''
+            }
+        }
+
+        stage('Destroy Infrastructure (Manual)') {
+            when {
+                expression { return params.DESTROY == true }
+            }
+            steps {
+                sh '''
+                cd project
+                terraform -chdir=$TF_ROOT destroy -auto-approve
+                '''
+            }
+        }
+    }
+}
