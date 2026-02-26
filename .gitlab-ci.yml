@@ -1,0 +1,159 @@
+default:
+  tags:
+    - ec2
+
+stages:
+  - validate
+  - plan
+  - provision
+  - deploy
+  - test
+  - cleanup
+
+variables:
+  TF_ROOT: terraform
+
+############################
+# VALIDATE STAGE
+############################
+
+terraform_validate:
+  stage: validate
+  script:
+    - terraform -chdir=$TF_ROOT init -input=false
+    - terraform -chdir=$TF_ROOT validate
+    - terraform -chdir=$TF_ROOT fmt -check
+
+terraform_lint:
+  stage: validate
+  script:
+    - tflint --chdir=$TF_ROOT --init
+    - tflint --chdir=$TF_ROOT
+
+docker_validate:
+  stage: validate
+  script:
+    - docker compose config
+
+############################
+# PLAN STAGE
+############################
+
+terraform_plan:
+  stage: plan
+  script:
+    - terraform -chdir=$TF_ROOT init -input=false
+    - terraform -chdir=$TF_ROOT plan -out=tfplan
+  artifacts:
+    paths:
+      - $TF_ROOT/tfplan
+
+############################
+# PROVISION STAGE (MANUAL)
+############################
+
+terraform_apply:
+  stage: provision
+  when: manual
+  timeout: 30m
+  script:
+    - terraform -chdir=$TF_ROOT init -input=false
+    - terraform -chdir=$TF_ROOT apply -auto-approve
+    - terraform -chdir=$TF_ROOT output -raw instance_public_ip > server_ip.txt
+    - terraform -chdir=$TF_ROOT output -raw private_key > private_key.pem
+  artifacts:
+    paths:
+      - server_ip.txt
+      - private_key.pem
+
+
+############################
+# DEPLOY STAGE
+############################
+
+deploy_directus:
+  stage: deploy
+  dependencies:
+    - terraform_apply
+  script:
+    - |
+      chmod 600 private_key.pem
+      SERVER_IP=$(cat server_ip.txt)
+      echo "Server IP: $SERVER_IP"
+
+      scp -o StrictHostKeyChecking=no -i private_key.pem docker-compose.yml ubuntu@$SERVER_IP:/home/ubuntu/
+
+      printf "POSTGRES_USER=%s\n" "$POSTGRES_USER" > .env
+      printf "POSTGRES_PASSWORD=%s\n" "$POSTGRES_PASSWORD" >> .env
+      printf "POSTGRES_DB=%s\n" "$POSTGRES_DB" >> .env
+      printf "POSTGRES_HOST=%s\n" "$POSTGRES_HOST" >> .env
+      printf "POSTGRES_PORT=%s\n" "$POSTGRES_PORT" >> .env
+      printf "SECRET_KEY=%s\n" "$SECRET_KEY" >> .env
+
+      scp -o StrictHostKeyChecking=no -i private_key.pem .env ubuntu@$SERVER_IP:/home/ubuntu/
+
+      ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP "docker compose up -d"
+
+      echo "Waiting for Directus..."
+      for i in $(seq 1 20); do
+        if curl -s http://$SERVER_IP:8055 > /dev/null; then
+          echo "Directus is up!"
+          exit 0
+        fi
+        sleep 5
+      done
+
+      echo "Directus failed to start"
+      exit 1
+  artifacts:
+    paths:
+      - server_ip.txt
+
+############################
+# TEST STAGE
+############################
+
+health_check:
+  stage: test
+  dependencies:
+    - deploy_directus
+  script:
+    - SERVER_IP=$(cat server_ip.txt)
+    - curl -f http://$SERVER_IP:8055
+
+capture_homepage:
+  stage: test
+  dependencies:
+    - deploy_directus
+  script:
+    - SERVER_IP=$(cat server_ip.txt)
+    - curl http://$SERVER_IP:8055 -o directus_homepage.html
+  artifacts:
+    paths:
+      - directus_homepage.html
+
+generate_report:
+  stage: test
+  dependencies:
+    - deploy_directus
+  script:
+    - |
+      SERVER_IP=$(cat server_ip.txt)
+      echo "# Deployment Report" > deployment_report.md
+      echo "- Server IP: $SERVER_IP" >> deployment_report.md
+      echo "- Pipeline Status: SUCCESS" >> deployment_report.md
+      echo "- URL: http://$SERVER_IP:8055" >> deployment_report.md
+  artifacts:
+    paths:
+      - deployment_report.md
+
+############################
+# CLEANUP STAGE (MANUAL)
+############################
+
+terraform_destroy:
+  stage: cleanup
+  when: manual
+  script:
+    - terraform -chdir=$TF_ROOT init -input=false
+    - terraform -chdir=$TF_ROOT destroy -auto-approve

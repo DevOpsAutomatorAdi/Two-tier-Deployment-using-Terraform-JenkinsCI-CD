@@ -1,0 +1,4 @@
+Jenkins URL: http://3.109.212.203:8080
+
+Username: admin
+Password: Admin@123
