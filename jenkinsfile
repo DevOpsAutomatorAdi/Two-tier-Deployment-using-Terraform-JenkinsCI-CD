@@ -4,13 +4,14 @@ pipeline {
     parameters {
         booleanParam(
             name: 'DESTROY',
-            defaultValue: false,
-            description: 'Destroy infrastructure'
+            defaultValue: true,
+            description: 'Run destroy instead of apply'
         )
     }
 
     environment {
         TF_ROOT = "terraform"
+        AWS_REGION = "ap-south-1"
         REPO = "https://github.com/DevOpsAutomatorAdi/Two-tier-Deployment-using-Terraform-JenkinsCI-CD.git"
     }
 
@@ -21,21 +22,61 @@ pipeline {
                 sh '''
                 rm -rf project
                 git clone $REPO project
-                cd project
-                ls -la
                 '''
             }
         }
 
-        stage('Validate Terraform') {
+        /*
+        ============================
+        DESTROY FLOW (RUN FIRST)
+        ============================
+        */
+
+        stage('Approve Destroy') {
+            when { expression { params.DESTROY } }
+            steps {
+                timeout(time: 20, unit: 'MINUTES') {
+                    input message: "Destroy Terraform Infrastructure?", ok: "Destroy"
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+            when { expression { params.DESTROY } }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-cred']
+                ]) {
+
+                    sh '''
+                    cd project
+
+                    export AWS_DEFAULT_REGION=$AWS_REGION
+
+                    terraform -chdir=$TF_ROOT init -input=false
+
+                    terraform -chdir=$TF_ROOT plan -destroy \
+                    -var="region=$AWS_REGION"
+
+                    terraform -chdir=$TF_ROOT destroy \
+                    -var="region=$AWS_REGION" \
+                    -auto-approve
+                    '''
+                }
+            }
+        }
+
+        /*
+        ============================
+        APPLY FLOW
+        ============================
+        */
+
+        stage('Terraform Validate') {
+            when { not { expression { params.DESTROY } } }
             steps {
                 sh '''
                 cd project
-
-                if [ ! -d "$TF_ROOT" ]; then
-                  echo "Terraform folder not found!"
-                  exit 1
-                fi
 
                 terraform -chdir=$TF_ROOT init -input=false
                 terraform -chdir=$TF_ROOT validate
@@ -45,100 +86,68 @@ pipeline {
         }
 
         stage('Terraform Plan') {
+            when { not { expression { params.DESTROY } } }
             steps {
-                sh '''
-                cd project
-                terraform -chdir=$TF_ROOT init -input=false
-                terraform -chdir=$TF_ROOT plan -out=tfplan
-                '''
-            }
-        }
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-cred']
+                ]) {
 
-        stage('Manual Approval') {
-            steps {
-                timeout(time: 30, unit: 'MINUTES') {
-                    input message: "Approve Infrastructure Provision?", ok: "Apply Terraform"
+                    sh '''
+                    cd project
+                    export AWS_DEFAULT_REGION=$AWS_REGION
+
+                    terraform -chdir=$TF_ROOT plan \
+                    -var="region=$AWS_REGION" \
+                    -out=tfplan
+                    '''
                 }
             }
         }
 
-        stage('Provision Infrastructure') {
+        stage('Approve Apply') {
+            when { not { expression { params.DESTROY } } }
             steps {
-                sh '''
-                cd project
-                terraform -chdir=$TF_ROOT apply -auto-approve
-
-                terraform -chdir=$TF_ROOT output -raw instance_public_ip > server_ip.txt
-                terraform -chdir=$TF_ROOT output -raw private_key > private_key.pem
-                '''
+                timeout(time: 20, unit: 'MINUTES') {
+                    input message: "Apply Terraform Infrastructure?", ok: "Apply"
+                }
             }
         }
 
-        stage('Deploy Application') {
+        stage('Terraform Apply') {
+            when { not { expression { params.DESTROY } } }
             steps {
-                sh '''
-                cd project
-                chmod 600 private_key.pem
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-cred']
+                ]) {
 
-                SERVER_IP=$(cat server_ip.txt)
+                    sh '''
+                    cd project
+                    export AWS_DEFAULT_REGION=$AWS_REGION
 
-                ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP \
-                "docker ps || true"
+                    terraform -chdir=$TF_ROOT apply \
+                    -var="region=$AWS_REGION" \
+                    -auto-approve
 
-                ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP \
-                "cd ~/gitlab-test && docker compose down || true && docker compose up -d --build"
-                '''
+                    terraform -chdir=$TF_ROOT output -raw instance_public_ip > server_ip.txt
+                    terraform -chdir=$TF_ROOT output -raw private_key > private_key.pem
+                    '''
+                }
             }
         }
 
-        stage('Health Check') {
-            steps {
-                sh '''
-                cd project
-                SERVER_IP=$(cat server_ip.txt)
+    }
 
-                echo "Checking application..."
-                sleep 20
-                curl -f http://$SERVER_IP:8085
-                '''
-            }
+    post {
+        aborted {
+            echo "Pipeline aborted by user"
         }
 
-        stage('Capture Homepage') {
-            steps {
-                sh '''
-                cd project
-                SERVER_IP=$(cat server_ip.txt)
-
-                curl http://$SERVER_IP:8085 -o directus_homepage.html
-                '''
-            }
+        success {
+            echo "Pipeline completed successfully"
         }
 
-        stage('Generate Report') {
-            steps {
-                sh '''
-                cd project
-                SERVER_IP=$(cat server_ip.txt)
-
-                echo "# Deployment Report" > deployment_report.md
-                echo "- Server IP: $SERVER_IP" >> deployment_report.md
-                echo "- Pipeline Status: SUCCESS" >> deployment_report.md
-                echo "- URL: http://$SERVER_IP:8085" >> deployment_report.md
-                '''
-            }
-        }
-
-        stage('Destroy Infrastructure (Manual)') {
-            when {
-                expression { return params.DESTROY == true }
-            }
-            steps {
-                sh '''
-                cd project
-                terraform -chdir=$TF_ROOT destroy -auto-approve
-                '''
-            }
+        failure {
+            echo "Pipeline failed"
         }
     }
 }
